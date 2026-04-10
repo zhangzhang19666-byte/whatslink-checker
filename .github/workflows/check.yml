@@ -11,10 +11,6 @@ on:
         description: '正常请求间隔秒数（默认 2）'
         required: false
         default: '2'
-      retry_delay:
-        description: '限流重试时的请求间隔秒数（默认 4）'
-        required: false
-        default: '4'
 
 jobs:
   check:
@@ -47,7 +43,6 @@ jobs:
         env:
           TXT_FILE:    ${{ github.event.inputs.txt_file || 'all' }}
           DELAY_SECS:  ${{ github.event.inputs.delay_secs || '2' }}
-          RETRY_DELAY: ${{ github.event.inputs.retry_delay || '4' }}
         run: python check.py
 
       # 无论成功/超时/取消都上传 work/，同时保存 JSONL 进度和所有 TXT

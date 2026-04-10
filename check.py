@@ -37,10 +37,9 @@ COMPLETED_FILE = WORK_DIR / ".completed"   # 已全部处理完的文件 stem
 # ── API ───────────────────────────────────────────────────────────────
 API         = "https://whatslink.info/api/v1/link"
 DELAY       = float(os.environ.get("DELAY_SECS", "2"))
-RETRY_DELAY = float(os.environ.get("RETRY_DELAY", "4"))
 
-# 每轮重试前等待的秒数（逐轮加长）：90s → 3min → 5min → 10min → 15min
-RETRY_WAITS = [90, 180, 300, 600, 900]
+# 限流后等待 90s，然后以同样的 2s 间隔重试一轮
+RETRY_WAITS = [90]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -187,7 +186,7 @@ def process_file(txt_path: Path) -> List[str]:
             append_record(stem, rec)   # 追加新状态，load 时取最后一条
             if status == "quota_limited":
                 still_limited.append(url)
-            time.sleep(RETRY_DELAY)   # 重试轮次间隔更慢
+            time.sleep(DELAY)
 
         resolved = len(quota_retry) - len(still_limited)
         log(f"  第 {rnd} 轮完成：解决 {resolved} 条，仍限流 {len(still_limited)} 条")
