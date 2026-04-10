@@ -8,9 +8,13 @@ on:
         required: false
         default: 'all'
       delay_secs:
-        description: '正常请求间隔秒数（默认 2）'
+        description: '正常请求间隔秒数（默认 2.8）'
         required: false
-        default: '2'
+        default: '2.8'
+      retry_delay:
+        description: '限流重试轮次中每条请求间隔秒数（默认 5）'
+        required: false
+        default: '5'
 
 jobs:
   check:
@@ -18,8 +22,28 @@ jobs:
     timeout-minutes: 350
 
     steps:
-      - name: Checkout repository
+      - name: Checkout main repo
         uses: actions/checkout@v4
+
+      # 从私有数据仓库拉取 data/ 目录（需配置 GH_PAT secret）
+      # DATA_REPO 格式：owner/repo-name，如 zhangzhang19666-byte/whatslink-data
+      - name: Fetch data from private repo
+        env:
+          GH_PAT:    ${{ secrets.GH_PAT }}
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+        run: |
+          if [ -z "$GH_PAT" ] || [ -z "$DATA_REPO" ]; then
+            echo "⚠️  未配置 GH_PAT 或 DATA_REPO，跳过私有数据拉取（使用仓库内 data/）"
+          else
+            echo "📥 从私有仓库 $DATA_REPO 拉取 data/..."
+            git clone "https://x-access-token:${GH_PAT}@github.com/${DATA_REPO}.git" _data_repo
+            mkdir -p data
+            cp _data_repo/*.txt data/ 2>/dev/null || true
+            cp -r _data_repo/data/*.txt data/ 2>/dev/null || true
+            rm -rf _data_repo
+            echo "✅ data/ 文件："
+            ls data/
+          fi
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -42,7 +66,8 @@ jobs:
       - name: Run ed2k checker
         env:
           TXT_FILE:    ${{ github.event.inputs.txt_file || 'all' }}
-          DELAY_SECS:  ${{ github.event.inputs.delay_secs || '2' }}
+          DELAY_SECS:  ${{ github.event.inputs.delay_secs || '2.8' }}
+          RETRY_DELAY: ${{ github.event.inputs.retry_delay || '5' }}
         run: python check.py
 
       # 无论成功/超时/取消都上传 work/，同时保存 JSONL 进度和所有 TXT
