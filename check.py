@@ -24,6 +24,16 @@ from typing import Dict, List, Set, Tuple
 
 import requests
 
+
+def read_text(path: Path) -> str:
+    """尝试多种编码读取文件，兼容 UTF-8 / UTF-8 BOM / UTF-16 / GBK"""
+    for enc in ("utf-8-sig", "utf-16", "gbk", "latin-1"):
+        try:
+            return path.read_text(encoding=enc)
+        except (UnicodeDecodeError, Exception):
+            continue
+    return ""   # 所有编码都失败则返回空字符串
+
 # ── 目录 ──────────────────────────────────────────────────────────────
 SCRIPT_DIR = Path(os.path.dirname(os.path.abspath(__file__)))
 DATA_DIR   = SCRIPT_DIR / "data"
@@ -56,7 +66,7 @@ def log(msg: str):
 def load_completed() -> Set[str]:
     if not COMPLETED_FILE.exists():
         return set()
-    return {l.strip() for l in COMPLETED_FILE.read_text("utf-8").splitlines() if l.strip()}
+    return {l.strip() for l in read_text(COMPLETED_FILE).splitlines() if l.strip()}
 
 
 def mark_completed(stem: str):
@@ -74,7 +84,7 @@ def load_progress(stem: str) -> Dict[str, dict]:
     p = WORK_DIR / f"{stem}.jsonl"
     records: Dict[str, dict] = {}
     if p.exists():
-        for line in p.read_text("utf-8").splitlines():
+        for line in read_text(p).splitlines():
             line = line.strip()
             if not line:
                 continue
@@ -142,7 +152,7 @@ def process_file(txt_path: Path) -> List[str]:
     log(f"▶  {txt_path.name}")
     log(f"{'━'*60}")
 
-    all_urls = [u.strip() for u in txt_path.read_text("utf-8").splitlines()
+    all_urls = [u.strip() for u in read_text(txt_path).splitlines()
                 if u.strip() and not u.startswith("#")]
     done_map = load_progress(stem)
 
@@ -238,7 +248,7 @@ def print_status(txt_files: List[Path]):
     print(f"  {'─'*36} {'─'*10} {'─'*6} {'─'*6} {'─'*6}")
     for f in txt_files:
         stem    = f.stem
-        total   = sum(1 for l in f.read_text("utf-8").splitlines() if l.strip())
+        total   = sum(1 for l in read_text(f).splitlines() if l.strip())
         jsonl   = WORK_DIR / f"{stem}.jsonl"
         if not jsonl.exists():
             mark = "🆕"

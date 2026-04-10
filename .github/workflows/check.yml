@@ -82,14 +82,32 @@ jobs:
             echo "✅ 结果已推送到私有仓库"
           fi
 
-      # 如果还有未完成任务，自动触发下一次运行
+      # 如果还有未完成任务（或脚本崩溃），自动触发下一次运行
       - name: Auto-trigger next run if needed
         if: always()
         env:
           GH_TOKEN: ${{ secrets.GH_PAT }}
         run: |
+          # .needs_rerun 存在 = 脚本正常判断有剩余任务
+          # .completed 不存在或 work/ 有 quota_limited = 脚本崩溃/超时，保守地继续触发
+          NEEDS_RERUN=false
+
           if [ -f "work/.needs_rerun" ]; then
-            echo "⏭️  检测到 .needs_rerun，30s 后自动触发下一次..."
+            NEEDS_RERUN=true
+            echo "⏭️  检测到 .needs_rerun 标记"
+          elif [ "${{ job.status }}" != "success" ]; then
+            # 脚本崩溃或超时，只要 work/ 里还有 quota_limited 就继续
+            if grep -r '"quota_limited"' work/*.jsonl 2>/dev/null | head -1 | grep -q quota_limited; then
+              NEEDS_RERUN=true
+              echo "⏭️  脚本异常退出但仍有限流未完成，继续触发"
+            elif [ "${{ job.status }}" = "cancelled" ] || [ "${{ job.status }}" = "failure" ]; then
+              NEEDS_RERUN=true
+              echo "⏭️  任务被中断，继续触发以保证进度"
+            fi
+          fi
+
+          if [ "$NEEDS_RERUN" = "true" ]; then
+            echo "等待 30s 后触发下一次..."
             sleep 30
             gh workflow run check.yml \
               --repo ${{ github.repository }} \
