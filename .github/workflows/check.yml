@@ -33,12 +33,9 @@ jobs:
         run: |
           echo "📥 从私有仓库 $DATA_REPO 拉取..."
           git clone "https://x-access-token:${GH_PAT}@github.com/${DATA_REPO}.git" _data_repo
-          # 拉取 txt 输入文件
           mkdir -p data
           cp _data_repo/*.txt data/ 2>/dev/null || true
-          echo "✅ data/ 文件："
-          ls data/
-          # 恢复 work/ 进度（JSONL + .completed）
+          echo "✅ data/ 文件数：$(ls data/*.txt 2>/dev/null | wc -l)"
           if [ -d "_data_repo/work" ]; then
             cp -r _data_repo/work ./
             echo "✅ work/ 进度已恢复"
@@ -71,7 +68,6 @@ jobs:
           DATA_REPO: ${{ secrets.DATA_REPO }}
         run: |
           git clone "https://x-access-token:${GH_PAT}@github.com/${DATA_REPO}.git" _push_repo
-          # 同步 work/ 到私有仓库
           rm -rf _push_repo/work
           cp -r work _push_repo/work
           cd _push_repo
@@ -81,7 +77,27 @@ jobs:
           if git diff --cached --quiet; then
             echo "无变化，跳过推送"
           else
-            git commit -m "update work/ results [run #${{ github.run_number }}]"
+            git commit -m "update work/ [run #${{ github.run_number }}]"
             git push "https://x-access-token:${GH_PAT}@github.com/${DATA_REPO}.git" main
             echo "✅ 结果已推送到私有仓库"
+          fi
+
+      # 如果还有未完成任务，自动触发下一次运行
+      - name: Auto-trigger next run if needed
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GH_PAT }}
+        run: |
+          if [ -f "work/.needs_rerun" ]; then
+            echo "⏭️  检测到 .needs_rerun，30s 后自动触发下一次..."
+            sleep 30
+            gh workflow run check.yml \
+              --repo ${{ github.repository }} \
+              --ref main \
+              -f txt_file=all \
+              -f delay_secs=2.8 \
+              -f retry_delay=5
+            echo "✅ 已触发下一次运行"
+          else
+            echo "🎉 所有任务完成，无需继续"
           fi

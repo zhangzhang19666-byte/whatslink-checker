@@ -317,6 +317,26 @@ def main():
     build_final_output(txt_files)
     print_status(txt_files)
 
+    # 判断是否还有未完成的工作，写标记供工作流决定是否自动触发下一次
+    completed = load_completed()
+    still_pending = [f for f in txt_files if f.stem not in completed]
+    needs_rerun = False
+    for f in still_pending:
+        dm = load_progress(f.stem)
+        total = sum(1 for l in f.read_text("utf-8").splitlines() if l.strip())
+        lim   = sum(1 for r in dm.values() if r.get("status") == "quota_limited")
+        if lim > 0 or len(dm) < total:
+            needs_rerun = True
+            break
+
+    flag = WORK_DIR / ".needs_rerun"
+    if needs_rerun:
+        flag.write_text("1", "utf-8")
+        log("⏭️  仍有未完成任务，已写入 .needs_rerun 标记，工作流将自动触发下一次")
+    else:
+        flag.unlink(missing_ok=True)
+        log("🎉 所有任务全部完成！")
+
 
 if __name__ == "__main__":
     main()
