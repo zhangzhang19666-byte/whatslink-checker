@@ -25,25 +25,27 @@ jobs:
       - name: Checkout main repo
         uses: actions/checkout@v4
 
-      # 从私有数据仓库拉取 data/ 目录（需配置 GH_PAT secret）
-      # DATA_REPO 格式：owner/repo-name，如 zhangzhang19666-byte/whatslink-data
-      - name: Fetch data from private repo
+      # 从私有数据仓库拉取 data/ 和 work/（进度续接）
+      - name: Fetch data and progress from private repo
         env:
           GH_PAT:    ${{ secrets.GH_PAT }}
           DATA_REPO: ${{ secrets.DATA_REPO }}
         run: |
-          if [ -z "$GH_PAT" ] || [ -z "$DATA_REPO" ]; then
-            echo "⚠️  未配置 GH_PAT 或 DATA_REPO，跳过私有数据拉取（使用仓库内 data/）"
+          echo "📥 从私有仓库 $DATA_REPO 拉取..."
+          git clone "https://x-access-token:${GH_PAT}@github.com/${DATA_REPO}.git" _data_repo
+          # 拉取 txt 输入文件
+          mkdir -p data
+          cp _data_repo/*.txt data/ 2>/dev/null || true
+          echo "✅ data/ 文件："
+          ls data/
+          # 恢复 work/ 进度（JSONL + .completed）
+          if [ -d "_data_repo/work" ]; then
+            cp -r _data_repo/work ./
+            echo "✅ work/ 进度已恢复"
           else
-            echo "📥 从私有仓库 $DATA_REPO 拉取 data/..."
-            git clone "https://x-access-token:${GH_PAT}@github.com/${DATA_REPO}.git" _data_repo
-            mkdir -p data
-            cp _data_repo/*.txt data/ 2>/dev/null || true
-            cp -r _data_repo/data/*.txt data/ 2>/dev/null || true
-            rm -rf _data_repo
-            echo "✅ data/ 文件："
-            ls data/
+            mkdir -p work
           fi
+          rm -rf _data_repo
 
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
@@ -54,15 +56,6 @@ jobs:
       - name: Install dependencies
         run: pip install -r requirements.txt
 
-      # 恢复上次 work/ 目录（JSONL进度 + .completed标记），实现断点续传
-      - name: Restore work directory cache
-        uses: actions/cache@v4
-        with:
-          path: work/
-          key: whatslink-work-${{ github.run_id }}
-          restore-keys: |
-            whatslink-work-
-
       - name: Run ed2k checker
         env:
           TXT_FILE:    ${{ github.event.inputs.txt_file || 'all' }}
@@ -70,22 +63,25 @@ jobs:
           RETRY_DELAY: ${{ github.event.inputs.retry_delay || '5' }}
         run: python check.py
 
-      # 无论成功/超时/取消都上传 work/，同时保存 JSONL 进度和所有 TXT
-      - name: Upload work directory (JSONL progress + all TXT results)
+      # 无论成功/超时/取消，都把 work/ 推回私有仓库
+      - name: Push results and progress back to private repo
         if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: work-${{ github.run_number }}
-          path: work/
-          retention-days: 90
-          if-no-files-found: warn
-
-      # 单独上传最终汇总 txt，方便直接下载
-      - name: Upload final merged ed2k result
-        if: always()
-        uses: actions/upload-artifact@v4
-        with:
-          name: all_success_ed2k-${{ github.run_number }}
-          path: work/all_success_ed2k.txt
-          retention-days: 90
-          if-no-files-found: warn
+        env:
+          GH_PAT:    ${{ secrets.GH_PAT }}
+          DATA_REPO: ${{ secrets.DATA_REPO }}
+        run: |
+          git clone "https://x-access-token:${GH_PAT}@github.com/${DATA_REPO}.git" _push_repo
+          # 同步 work/ 到私有仓库
+          rm -rf _push_repo/work
+          cp -r work _push_repo/work
+          cd _push_repo
+          git config user.email "action@github.com"
+          git config user.name "GitHub Actions"
+          git add work/
+          if git diff --cached --quiet; then
+            echo "无变化，跳过推送"
+          else
+            git commit -m "update work/ results [run #${{ github.run_number }}]"
+            git push "https://x-access-token:${GH_PAT}@github.com/${DATA_REPO}.git" main
+            echo "✅ 结果已推送到私有仓库"
+          fi
