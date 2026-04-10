@@ -38,8 +38,8 @@ COMPLETED_FILE = WORK_DIR / ".completed"   # 已全部处理完的文件 stem
 API         = "https://whatslink.info/api/v1/link"
 DELAY       = float(os.environ.get("DELAY_SECS", "2"))
 
-# 限流后等待 90s，然后以同样的 2s 间隔重试一轮
-RETRY_WAITS = [90]
+# 限流后重试 3 轮，每轮等待 90s，请求间隔 2s（同正常）
+RETRY_WAITS = [90, 90, 90]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -160,30 +160,31 @@ def process_file(txt_path: Path) -> List[str]:
             status, data = check_url(url, label)
             rec = {"url": url, "status": status, "ts": datetime.now().isoformat()}
             done_map[url] = rec
-            append_record(stem, rec)
+            append_record(stem, rec)          # JSONL 逐条追加，实时保存
             if status == "quota_limited":
                 new_quota.append(url)
             time.sleep(DELAY)
         quota_retry = quota_retry + new_quota
+        save_file_success_txt(stem, done_map) # 首轮结束后立即保存 TXT
 
-    # ── 多轮重试：直到没有限流 或 耗尽重试轮数 ─────────────────────────
+    # ── 3 轮重试：每轮等 90s，间隔 2s ────────────────────────────────────
     if quota_retry:
-        log(f"\n  共有 {len(quota_retry)} 条限流需要重试（最多 {len(RETRY_WAITS)} 轮）")
+        log(f"\n  共有 {len(quota_retry)} 条限流，开始重试（共 {len(RETRY_WAITS)} 轮）")
 
     for rnd, wait in enumerate(RETRY_WAITS, 1):
         if not quota_retry:
             break
         log(f"\n  ── 第 {rnd}/{len(RETRY_WAITS)} 轮重试 {len(quota_retry)} 条，"
-            f"先等待 {wait}s（{wait//60}分{wait%60}秒）... ──")
+            f"等待 {wait}s... ──")
         time.sleep(wait)
 
         still_limited: List[str] = []
         for i, url in enumerate(quota_retry, 1):
-            label = f"[重试 {rnd} | {i:>3}/{len(quota_retry)}]"
+            label = f"[重试{rnd} {i:>3}/{len(quota_retry)}]"
             status, data = check_url(url, label)
             rec = {"url": url, "status": status, "ts": datetime.now().isoformat()}
             done_map[url] = rec
-            append_record(stem, rec)   # 追加新状态，load 时取最后一条
+            append_record(stem, rec)          # JSONL 追加（load 时取最后一条）
             if status == "quota_limited":
                 still_limited.append(url)
             time.sleep(DELAY)
@@ -191,9 +192,10 @@ def process_file(txt_path: Path) -> List[str]:
         resolved = len(quota_retry) - len(still_limited)
         log(f"  第 {rnd} 轮完成：解决 {resolved} 条，仍限流 {len(still_limited)} 条")
         quota_retry = still_limited
+        save_file_success_txt(stem, done_map) # 每轮结束立即更新 TXT
 
     if quota_retry:
-        log(f"  ⚠️  已达最大重试轮数，仍有 {len(quota_retry)} 条未解决，留待下次运行续接")
+        log(f"  ⚠️  3 轮后仍有 {len(quota_retry)} 条限流，留待下次运行续接")
 
     # 统计
     ok    = sum(1 for r in done_map.values() if r.get("status") == "success")
