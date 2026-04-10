@@ -4,12 +4,14 @@
 whatslink.info ed2k 链接批量验证器
 - 读取 data/ 目录下所有 txt（每行一条 ed2k 链接）
 - JSONL 进度保存，支持断点续传
-- 被限流的 URL 自动重试一次
+- 被限流的 URL 多轮重试，直到全部解决或达到最大轮数
 - 全部完成后汇总所有成功链接到 work/all_success_ed2k.txt（A-Z 排序）
+- 每个文件另存 work/{stem}_success.txt
 
 环境变量：
-  TXT_FILE   : 指定 data/ 下某个文件名，或 all（默认 all）
-  DELAY_SECS : 每次请求间隔秒数（默认 2）
+  TXT_FILE    : 指定 data/ 下某个文件名，或 all（默认 all）
+  DELAY_SECS  : 正常请求间隔秒数（默认 2）
+  RETRY_DELAY : 重试请求间隔秒数（默认 4，比正常慢）
 """
 
 import argparse
@@ -33,9 +35,12 @@ WORK_DIR.mkdir(exist_ok=True)
 COMPLETED_FILE = WORK_DIR / ".completed"   # 已全部处理完的文件 stem
 
 # ── API ───────────────────────────────────────────────────────────────
-API          = "https://whatslink.info/api/v1/link"
-DELAY        = float(os.environ.get("DELAY_SECS", "2"))
-RETRY_WAIT   = 90   # 限流后等待秒数再重试
+API         = "https://whatslink.info/api/v1/link"
+DELAY       = float(os.environ.get("DELAY_SECS", "2"))
+RETRY_DELAY = float(os.environ.get("RETRY_DELAY", "4"))
+
+# 每轮重试前等待的秒数（逐轮加长）：90s → 3min → 5min → 10min → 15min
+RETRY_WAITS = [90, 180, 300, 600, 900]
 
 
 # ═══════════════════════════════════════════════════════════════════════
@@ -46,7 +51,7 @@ def log(msg: str):
     print(f"[{datetime.now().strftime('%H:%M:%S')}] {msg}", flush=True)
 
 
-# ── 已完成文件标记（同 pikpak 模式，防止重复执行）─────────────────────
+# ── 已完成文件标记 ─────────────────────────────────────────────────────
 
 def load_completed() -> Set[str]:
     if not COMPLETED_FILE.exists():
@@ -65,7 +70,7 @@ def mark_completed(stem: str):
 # ── JSONL 进度（每条 URL 一行，重复 URL 以最后一条为准）──────────────
 
 def load_progress(stem: str) -> Dict[str, dict]:
-    """返回 {url: record}，重复 url 保留最后写入的记录"""
+    """返回 {url: record}，重复 url 保留最后写入的记录（支持多轮重试覆盖）"""
     p = WORK_DIR / f"{stem}.jsonl"
     records: Dict[str, dict] = {}
     if p.exists():
@@ -75,14 +80,14 @@ def load_progress(stem: str) -> Dict[str, dict]:
                 continue
             try:
                 rec = json.loads(line)
-                records[rec["url"]] = rec   # 后写覆盖前写
+                records[rec["url"]] = rec
             except Exception:
                 pass
     return records
 
 
 def append_record(stem: str, rec: dict):
-    """追加一条记录到 JSONL（幂等，重试时再追加一条即可）"""
+    """追加一条记录到 JSONL（重试时再追加，load 时取最后一条）"""
     p = WORK_DIR / f"{stem}.jsonl"
     with open(p, "a", encoding="utf-8") as f:
         f.write(json.dumps(rec, ensure_ascii=False) + "\n")
@@ -90,12 +95,13 @@ def append_record(stem: str, rec: dict):
 
 # ── API 调用 ──────────────────────────────────────────────────────────
 
-def check_url(url: str, idx: int, total: int) -> Tuple[str, dict]:
+def check_url(url: str, label: str) -> Tuple[str, dict]:
     """
     返回 (status, data)
     status: "success" | "failed" | "quota_limited"
+    label: 显示用的进度文字，如 "[  3/75]"
     """
-    log(f"  [{idx:>4}/{total}] {url[:90]}")
+    log(f"  {label} {url[:90]}")
     try:
         resp = requests.get(API, params={"url": url}, timeout=30)
         data = resp.json()
@@ -112,6 +118,15 @@ def check_url(url: str, idx: int, total: int) -> Tuple[str, dict]:
         return "failed", {"error": str(e)}
 
 
+# ─── 保存单文件成功 txt ────────────────────────────────────────────────
+
+def save_file_success_txt(stem: str, done_map: Dict[str, dict]):
+    success = sorted(u for u, r in done_map.items() if r.get("status") == "success")
+    out = WORK_DIR / f"{stem}_success.txt"
+    out.write_text("\n".join(success) + ("\n" if success else ""), "utf-8")
+    return success
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  单文件处理
 # ═══════════════════════════════════════════════════════════════════════
@@ -119,7 +134,8 @@ def check_url(url: str, idx: int, total: int) -> Tuple[str, dict]:
 def process_file(txt_path: Path) -> List[str]:
     """
     处理一个 txt 文件，返回本文件所有成功的 ed2k URL 列表。
-    支持断点续传：已完成的 URL 直接跳过，quota_limited 会重试一轮。
+    - 已完成的 URL 直接跳过（断点续传）
+    - 被限流的 URL 多轮重试，直到全部解决或达到最大轮数
     """
     stem = txt_path.stem
     log(f"\n{'━'*60}")
@@ -130,47 +146,68 @@ def process_file(txt_path: Path) -> List[str]:
                 if u.strip() and not u.startswith("#")]
     done_map = load_progress(stem)
 
-    # 分类：需要首次处理 / 需要重试限流 / 已完成跳过
-    pending       = [u for u in all_urls if u not in done_map]
-    quota_retry   = [u for u, r in done_map.items() if r.get("status") == "quota_limited"]
+    pending     = [u for u in all_urls if u not in done_map]
+    quota_retry = [u for u, r in done_map.items() if r.get("status") == "quota_limited"]
 
-    log(f"  总计 {len(all_urls)} 条 | 已完成 {len(done_map) - len(quota_retry)} | "
-        f"待处理 {len(pending)} | 限流重试 {len(quota_retry)}")
+    log(f"  总计 {len(all_urls)} 条 | 已完成(非限流) {len(done_map) - len(quota_retry)} | "
+        f"待处理 {len(pending)} | 限流待重试 {len(quota_retry)}")
 
-    if not pending and not quota_retry:
-        log(f"  [{stem}] 全部已处理，跳过")
-    else:
-        # ── 第一轮：处理 pending ──────────────────────────────────────
+    # ── 第一轮：处理真正未处理过的 pending ─────────────────────────────
+    if pending:
+        log(f"\n  ── 首次处理 {len(pending)} 条 ──")
         new_quota: List[str] = []
         for i, url in enumerate(pending, 1):
-            status, data = check_url(url, len(done_map) - len(quota_retry) + i, len(all_urls))
+            label = f"[{i:>4}/{len(pending)}]"
+            status, data = check_url(url, label)
             rec = {"url": url, "status": status, "ts": datetime.now().isoformat()}
             done_map[url] = rec
             append_record(stem, rec)
             if status == "quota_limited":
                 new_quota.append(url)
             time.sleep(DELAY)
+        quota_retry = quota_retry + new_quota
 
-        # ── 第二轮：重试限流（旧的 + 本轮新产生的）────────────────────
-        retry_list = quota_retry + new_quota
-        if retry_list:
-            log(f"\n  重试 {len(retry_list)} 条被限流 URL，等待 {RETRY_WAIT}s...")
-            time.sleep(RETRY_WAIT)
-            for i, url in enumerate(retry_list, 1):
-                status, data = check_url(url, i, len(retry_list))
-                rec = {"url": url, "status": status, "ts": datetime.now().isoformat()}
-                done_map[url] = rec
-                append_record(stem, rec)   # 最新状态追加覆盖，load 时取最后一条
-                time.sleep(DELAY)
+    # ── 多轮重试：直到没有限流 或 耗尽重试轮数 ─────────────────────────
+    if quota_retry:
+        log(f"\n  共有 {len(quota_retry)} 条限流需要重试（最多 {len(RETRY_WAITS)} 轮）")
+
+    for rnd, wait in enumerate(RETRY_WAITS, 1):
+        if not quota_retry:
+            break
+        log(f"\n  ── 第 {rnd}/{len(RETRY_WAITS)} 轮重试 {len(quota_retry)} 条，"
+            f"先等待 {wait}s（{wait//60}分{wait%60}秒）... ──")
+        time.sleep(wait)
+
+        still_limited: List[str] = []
+        for i, url in enumerate(quota_retry, 1):
+            label = f"[重试 {rnd} | {i:>3}/{len(quota_retry)}]"
+            status, data = check_url(url, label)
+            rec = {"url": url, "status": status, "ts": datetime.now().isoformat()}
+            done_map[url] = rec
+            append_record(stem, rec)   # 追加新状态，load 时取最后一条
+            if status == "quota_limited":
+                still_limited.append(url)
+            time.sleep(RETRY_DELAY)   # 重试轮次间隔更慢
+
+        resolved = len(quota_retry) - len(still_limited)
+        log(f"  第 {rnd} 轮完成：解决 {resolved} 条，仍限流 {len(still_limited)} 条")
+        quota_retry = still_limited
+
+    if quota_retry:
+        log(f"  ⚠️  已达最大重试轮数，仍有 {len(quota_retry)} 条未解决，留待下次运行续接")
 
     # 统计
-    success_urls = [u for u, r in done_map.items() if r.get("status") == "success"]
-    failed_count  = sum(1 for r in done_map.values() if r.get("status") == "failed")
-    limited_count = sum(1 for r in done_map.values() if r.get("status") == "quota_limited")
-    log(f"  ✅ 有效 {len(success_urls)} | ❌ 无效 {failed_count} | ⏳ 仍限流 {limited_count}")
+    ok    = sum(1 for r in done_map.values() if r.get("status") == "success")
+    bad   = sum(1 for r in done_map.values() if r.get("status") == "failed")
+    lim   = sum(1 for r in done_map.values() if r.get("status") == "quota_limited")
+    log(f"\n  [{stem}] 结果：✅ 有效 {ok} | ❌ 无效 {bad} | ⏳ 仍限流 {lim}")
 
-    # 如果没有剩余待处理项，标记完成
-    if limited_count == 0:
+    # 保存本文件的成功 txt
+    success_urls = save_file_success_txt(stem, done_map)
+    log(f"  [{stem}] 已保存 → work/{stem}_success.txt（{len(success_urls)} 条）")
+
+    # 无限流剩余则标记完成
+    if lim == 0:
         mark_completed(stem)
 
     return success_urls
@@ -194,47 +231,46 @@ def collect_txt_files(txt_file: str) -> List[Path]:
 
 def print_status(txt_files: List[Path]):
     completed = load_completed()
-    print("=" * 64)
-    print(f"  {'文件':<35} {'状态':<12} {'成功':>6} {'失败':>6} {'限流':>6}")
-    print(f"  {'─'*35} {'─'*12} {'─'*6} {'─'*6} {'─'*6}")
+    print("\n" + "=" * 68)
+    print(f"  {'文件':<36} {'状态':<10} {'✅成功':>6} {'❌无效':>6} {'⏳限流':>6}")
+    print(f"  {'─'*36} {'─'*10} {'─'*6} {'─'*6} {'─'*6}")
     for f in txt_files:
-        stem = f.stem
+        stem    = f.stem
+        total   = sum(1 for l in f.read_text("utf-8").splitlines() if l.strip())
+        jsonl   = WORK_DIR / f"{stem}.jsonl"
+        if not jsonl.exists():
+            mark = "🆕"
+            stat = "未开始"
+            print(f"  {mark+' '+stem[:34]:<36} {stat:<10} {'—':>6} {'—':>6} {total:>6}")
+            continue
+        dm  = load_progress(stem)
+        ok  = sum(1 for r in dm.values() if r.get("status") == "success")
+        bad = sum(1 for r in dm.values() if r.get("status") == "failed")
+        lim = sum(1 for r in dm.values() if r.get("status") == "quota_limited")
+        pct = int(len(dm) / total * 100) if total else 0
         if stem in completed:
-            # 读取 JSONL 获取数量
-            done_map = load_progress(stem)
-            ok  = sum(1 for r in done_map.values() if r.get("status") == "success")
-            bad = sum(1 for r in done_map.values() if r.get("status") == "failed")
-            print(f"  {'✅ '+stem[:33]:<35} {'已完成':<12} {ok:>6} {bad:>6} {'0':>6}")
+            mark, stat = "✅", "已完成"
+        elif lim == 0 and len(dm) >= total:
+            mark, stat = "✅", "已完成"
         else:
-            jsonl = WORK_DIR / f"{stem}.jsonl"
-            if not jsonl.exists():
-                total = sum(1 for l in f.read_text("utf-8").splitlines() if l.strip())
-                print(f"  {'🆕 '+stem[:33]:<35} {'未开始':<12} {'—':>6} {'—':>6} {total:>6}")
-            else:
-                done_map = load_progress(stem)
-                ok  = sum(1 for r in done_map.values() if r.get("status") == "success")
-                bad = sum(1 for r in done_map.values() if r.get("status") == "failed")
-                lim = sum(1 for r in done_map.values() if r.get("status") == "quota_limited")
-                total = sum(1 for l in f.read_text("utf-8").splitlines() if l.strip())
-                pct   = int(len(done_map) / total * 100) if total else 0
-                mark  = "✅" if lim == 0 and len(done_map) >= total else "⏳"
-                print(f"  {mark+' '+stem[:33]:<35} {f'{pct}%':<12} {ok:>6} {bad:>6} {lim:>6}")
-    print("=" * 64)
+            mark, stat = "⏳", f"{pct}%进行中"
+        print(f"  {mark+' '+stem[:34]:<36} {stat:<10} {ok:>6} {bad:>6} {lim:>6}")
+    print("=" * 68)
 
 
 def build_final_output(txt_files: List[Path]):
-    """汇总所有文件的成功 ed2k 链接，去重，A-Z 排序，写入统一 txt"""
+    """汇总所有文件的成功 ed2k 链接，去重，A-Z 排序"""
     all_success: List[str] = []
     for f in txt_files:
-        done_map = load_progress(f.stem)
-        all_success.extend(u for u, r in done_map.items() if r.get("status") == "success")
+        dm = load_progress(f.stem)
+        all_success.extend(u for u, r in dm.items() if r.get("status") == "success")
 
-    deduped = sorted(set(all_success))   # A-Z 排序（按字母序）
+    deduped = sorted(set(all_success))
     out = WORK_DIR / "all_success_ed2k.txt"
     out.write_text("\n".join(deduped) + ("\n" if deduped else ""), "utf-8")
     log(f"\n{'='*60}")
-    log(f"汇总完成：共 {len(deduped)} 条有效 ed2k 链接（已去重）")
-    log(f"输出文件: {out.name}")
+    log(f"汇总完成：{len(deduped)} 条有效 ed2k（去重后，A-Z 排序）")
+    log(f"输出文件: work/all_success_ed2k.txt")
     return out
 
 
@@ -244,7 +280,7 @@ def main():
                         default=os.environ.get("TXT_FILE", "all"),
                         help="data/ 下的文件名，或 all（默认）")
     parser.add_argument("--status", "-s", action="store_true",
-                        help="只显示进度状态，不执行")
+                        help="只显示进度，不执行")
     args = parser.parse_args()
 
     try:
@@ -254,7 +290,6 @@ def main():
         return
 
     print_status(txt_files)
-
     if args.status:
         return
 
@@ -264,7 +299,7 @@ def main():
     if not to_run:
         log("所有文件均已完成，直接生成汇总文件...")
     else:
-        log(f"共 {len(txt_files)} 个文件，其中 {len(to_run)} 个待处理")
+        log(f"共 {len(txt_files)} 个文件，其中 {len(to_run)} 个需要处理")
         for txt_path in to_run:
             try:
                 process_file(txt_path)
@@ -277,7 +312,6 @@ def main():
                 log(f"❌ [{txt_path.stem}] 出错: {e}")
                 traceback.print_exc()
 
-    # 无论是否全部完成，都输出当前已知的成功链接
     build_final_output(txt_files)
     print_status(txt_files)
 
