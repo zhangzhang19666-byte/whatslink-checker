@@ -1,0 +1,66 @@
+name: ed2k Link Checker
+
+on:
+  workflow_dispatch:
+    inputs:
+      txt_file:
+        description: 'data/ 下的文件名（留空或 all 处理全部）'
+        required: false
+        default: 'all'
+      delay_secs:
+        description: '每次请求间隔秒数（默认 2，被限流时可调大）'
+        required: false
+        default: '2'
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Set up Python 3.11
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: 'pip'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      # 恢复上次 work/ 目录（JSONL 进度 + .completed 标记），实现断点续传
+      - name: Restore work directory cache
+        uses: actions/cache@v4
+        with:
+          path: work/
+          key: whatslink-work-${{ github.run_id }}
+          restore-keys: |
+            whatslink-work-
+
+      - name: Run ed2k checker
+        env:
+          TXT_FILE:    ${{ github.event.inputs.txt_file || 'all' }}
+          DELAY_SECS:  ${{ github.event.inputs.delay_secs || '2' }}
+        run: python check.py
+
+      # 无论成功/超时/取消都上传，保留进度
+      - name: Upload work directory (progress + results)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: work-${{ github.run_number }}
+          path: work/
+          retention-days: 90
+          if-no-files-found: warn
+
+      # 单独上传最终汇总 txt，方便直接下载
+      - name: Upload final ed2k result
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: all_success_ed2k-${{ github.run_number }}
+          path: work/all_success_ed2k.txt
+          retention-days: 90
+          if-no-files-found: warn
