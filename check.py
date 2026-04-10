@@ -158,7 +158,7 @@ def process_file(txt_path: Path) -> List[str]:
         for i, url in enumerate(pending, 1):
             label = f"[{i:>4}/{len(pending)}]"
             status, data = check_url(url, label)
-            rec = {"url": url, "status": status, "ts": datetime.now().isoformat()}
+            rec = {"url": url, "status": status, "data": data, "ts": datetime.now().isoformat()}
             done_map[url] = rec
             append_record(stem, rec)          # JSONL 逐条追加，实时保存
             if status == "quota_limited":
@@ -182,7 +182,7 @@ def process_file(txt_path: Path) -> List[str]:
         for i, url in enumerate(quota_retry, 1):
             label = f"[重试{rnd} {i:>3}/{len(quota_retry)}]"
             status, data = check_url(url, label)
-            rec = {"url": url, "status": status, "ts": datetime.now().isoformat()}
+            rec = {"url": url, "status": status, "data": data, "ts": datetime.now().isoformat()}
             done_map[url] = rec
             append_record(stem, rec)          # JSONL 追加（load 时取最后一条）
             if status == "quota_limited":
